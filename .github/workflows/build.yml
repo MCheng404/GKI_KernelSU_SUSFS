@@ -571,6 +571,18 @@ jobs:
           SUB_LEVEL: ${{ inputs.sub_level }}
         run: bash "$GITHUB_WORKSPACE/scripts/susfs_fixes/apply.sh"
 
+      - name: 修复 SukiSU kernel_umount set_handler 残留引用
+        if: inputs.ksu_variant == 'SukiSU'
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          UM="KernelSU/kernel/feature/kernel_umount.c"
+          if [ -f "$UM" ] && ! grep -qF 'static int kernel_umount_feature_set(' "$UM"; then
+            sed -i '/\.set_handler = kernel_umount_feature_set,/d' "$UM"
+            echo "已移除 kernel_umount_feature_set 残留引用（SukiSU 40901 bug）"
+          else
+            echo "kernel_umount_feature_set 存在或文件缺失，跳过修复"
+          fi
+
       - name: 克隆 Droidspaces 补丁仓库
         if: inputs.droidspaces != 'off'
         run: |
