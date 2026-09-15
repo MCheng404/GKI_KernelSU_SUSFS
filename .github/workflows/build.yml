@@ -351,6 +351,9 @@ jobs:
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
+          if [ "${{ inputs.os_patch_level }}" = "main" ]; then
+            FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}"
+          fi
           MAX_ATTEMPTS=3
           RETRY_DELAY=15
           SYNC_TIMEOUT=15m
