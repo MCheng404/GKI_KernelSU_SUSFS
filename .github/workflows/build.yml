@@ -978,6 +978,40 @@ jobs:
             patch -p1 --forward < "$ACTION_BUILD/patches/unicode_bypass_fix_6.1+.patch" || true
           fi
 
+      - name: 应用网络/续航/F2FS 优化补丁集
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          set +e
+          apply_patch() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              patch -p1 --forward < "$f" && echo "已应用: $(basename "$f")" || echo "::warning::未应用(可能已打/上下文不符): $(basename "$f")"
+            else
+              echo "::warning::补丁文件不存在: $f"
+            fi
+          }
+          KP="$KERNEL_PATCHES/common"
+          # BBRv3（仅 6.6，sysctl 依赖先打）
+          if [ "${{ inputs.kernel_version }}" = "6.6" ]; then
+            apply_patch "$ACTION_BUILD/patches/bbrv3/sysctl_add_proc_dou8vec_minmax.patch"
+            apply_patch "$ACTION_BUILD/patches/bbrv3/sysctl_fix_data-races_in_proc_dou8vec_minmax.patch"
+            apply_patch "$ACTION_BUILD/patches/bbrv3/0001-net-tcp-backport-BBRv3-to-android15-6.6.patch"
+          fi
+          # 网络：TCP nodelay
+          apply_patch "$KP/force_tcp_nodelay.patch"
+          # 待机/续航三件套
+          apply_patch "$KP/avoid_extra_s2idle_wake_attempts.patch"
+          apply_patch "$KP/reduce_pci_pme_wakeups.patch"
+          apply_patch "$KP/add_timeout_wakelocks_globally.patch"
+          # F2FS 两补丁
+          apply_patch "$KP/f2fs_reduce_congestion.patch"
+          apply_patch "$KP/f2fs_enlarge_min_fsync_blocks.patch"
+          # mountify 等元模块需要 OverlayFS 内建
+          if ! grep -q '^CONFIG_OVERLAY_FS=y$' "$DEFCONFIG"; then
+            echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG"
+            echo "已内建 CONFIG_OVERLAY_FS=y"
+          fi
+
       - name: 配置 ZRAM LZ4 补丁栈
         if: inputs.use_zram
         working-directory: ${{ env.KERNEL_ROOT }}/common
