@@ -981,6 +981,8 @@ jobs:
       - name: 应用网络/续航/F2FS 优化补丁集
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
+          echo "基线验证：临时跳过所有优化补丁"
+          exit 0
           set +e
           apply_patch() {
             local f="$1"
