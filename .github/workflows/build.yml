@@ -607,6 +607,11 @@ jobs:
               ;;
             "SukiSU")
               echo "添加 ${{ inputs.ksu_variant }}..."
+              # 私有镜像缺少部分历史提交（如 1cfa5734），先克隆 GitHub 官方仓库；
+              # setup.sh 检测到 KernelSU 目录已存在会跳过 clone，后续 checkout 走 GitHub 远端
+              if [ ! -d KernelSU ]; then
+                git clone https://github.com/SukiSU-Nova/SukiSU-Nova KernelSU
+              fi
               curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" | bash $BRANCH
               ;;
             "BakaSU")
