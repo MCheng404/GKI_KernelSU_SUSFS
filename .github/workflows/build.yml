@@ -1666,6 +1666,26 @@ jobs:
             fi
           fi
 
+      - name: 修复 KSU 侧 SUSFS 声明与未使用告警
+        if: inputs.enable_susfs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          KSU_DIR="$PWD/common/drivers/kernelsu"
+          if [ -d "$KSU_DIR" ]; then
+            while IFS= read -r f; do
+              if ! grep -q 'linux/susfs.h' "$f"; then
+                sed -i '1i #include <linux/susfs.h>' "$f"
+                echo "补 include: $f"
+              fi
+            done < <(grep -rl 'susfs_' "$KSU_DIR" --include='*.c' || true)
+          fi
+          SUSFS_C="$PWD/common/fs/susfs.c"
+          if [ -f "$SUSFS_C" ] && ! grep -q 'diagnostic ignored "-Wunused-function"' "$SUSFS_C"; then
+            sed -i '1i #pragma clang diagnostic ignored "-Wunused-function"' "$SUSFS_C"
+            echo "已屏蔽 susfs.c 的 unused-function 告警"
+          fi
+
       - name: 编译内核
         id: compile_kernel
         uses: nick-fields/retry@v4
