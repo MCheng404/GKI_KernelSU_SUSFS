@@ -607,11 +607,6 @@ jobs:
               ;;
             "SukiSU")
               echo "添加 ${{ inputs.ksu_variant }}..."
-              # 私有镜像缺少部分历史提交（如 1cfa5734），先克隆 GitHub 官方仓库；
-              # setup.sh 检测到 KernelSU 目录已存在会跳过 clone，后续 checkout 走 GitHub 远端
-              if [ ! -d KernelSU ]; then
-                git clone https://github.com/SukiSU-Nova/SukiSU-Nova KernelSU
-              fi
               curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" | bash $BRANCH
               ;;
             "BakaSU")
@@ -1671,17 +1666,18 @@ jobs:
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           set -euo pipefail
-          KSU_DIR="$PWD/common/drivers/kernelsu"
-          if [ -d "$KSU_DIR" ]; then
-            while IFS= read -r f; do
-              if ! grep -q 'linux/susfs.h' "$f"; then
-                sed -i '1i #include <linux/susfs.h>' "$f"
-                echo "补 include: $f"
-              fi
-            done < <(grep -rl 'susfs_' "$KSU_DIR" --include='*.c' || true)
+          SUSFS_DEF="$PWD/common/include/linux/susfs_def.h"
+          if [ -f "$SUSFS_DEF" ] && ! grep -q 'linux/cred.h' "$SUSFS_DEF"; then
+            sed -i '1i #include <linux/cred.h>' "$SUSFS_DEF"
+            echo "susfs_def.h 已补 cred.h"
+          fi
+          KSU_MK="$PWD/common/drivers/kernelsu/Makefile"
+          if [ -f "$KSU_MK" ] && ! grep -q 'Wno-array-bounds' "$KSU_MK"; then
+            printf '\nccflags-y += -Wno-array-bounds -Wno-error=implicit-function-declaration\n' >> "$KSU_MK"
+            echo "KSU Makefile 已关闭 array-bounds 误报"
           fi
           SUSFS_C="$PWD/common/fs/susfs.c"
-          if [ -f "$SUSFS_C" ] && ! grep -q 'diagnostic ignored "-Wunused-function"' "$SUSFS_C"; then
+          if [ -f "$SUSFS_C" ] && ! grep -q 'Wunused-function' "$SUSFS_C"; then
             sed -i '1i #pragma clang diagnostic ignored "-Wunused-function"' "$SUSFS_C"
             echo "已屏蔽 susfs.c 的 unused-function 告警"
           fi
