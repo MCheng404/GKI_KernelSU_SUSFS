@@ -20,9 +20,9 @@ custom=true
 gki-android12-5.10=
 gki-android13-5.15=
 gki-android14-6.1=
-gki-android15-6.6=48b83803219cb1daa148507df9b87dae97bf4d8e
+gki-android15-6.6=f98f08223bbf469cc0a1542166383d253557fc32
 gki-android16-6.12=
 
 # ==================== SukiSU 的 commit hash ====================
 # 仅当 custom=true 且使用 SukiSU 变体时生效
-sukisu=1cfa57340590971cba7521ed536da8ebbedc5f0a
+sukisu=8c6c52a03ea7184444925ed56476440649701d5a
