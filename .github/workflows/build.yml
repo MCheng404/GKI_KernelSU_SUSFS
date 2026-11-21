@@ -1532,17 +1532,33 @@ jobs:
       - name: 添加 SUSFS 配置
         if: inputs.enable_susfs
         run: |
-          # 【第四轮】已确认：
-          #   关 SUS_MOUNT+SPOOF_UNAME+HIDE_SYMBOLS+BOOTCONFIG -> 桌面正常、Vulkan 错误 0
-          #   只关 SPOOF_UNAME（其余三个恢复）        -> Vulkan dlopen 失败、桌面崩溃
-          # 故 culprit 在这三个之中。SUS_MOUNT 嫌疑最大：
-          # 它分配假 mnt_id 并对非 su 进程隐藏 mountinfo，
-          # 而动态链接器靠挂载路径与 stat 去重库，直接影响可更新 GPU 驱动 APK 的库解析。
-          # 本轮只关 SUS_MOUNT + SPOOF_UNAME，恢复 HIDE_SYMBOLS 与 BOOTCONFIG。
+          # 【第五轮 / 全特性】两个阻塞点都已定位并各自解决，不再需要关闭任何子特性：
+          #
+          # 1) SPOOF_UNAME -> 卡开机动画（mSystemBooted 永远 false）
+          #    根因：它 hook newuname 系统调用，对「所有进程」生效。
+          #    perf HAL 用 uname() 识别 target，拿到被改写的串后 Target Init 永不完成，
+          #    走不到 WMS.systemBooted()。
+          #    解决：见后续「限制 SPOOF_UNAME 只作用于应用进程」步骤，加 uid >= 10000 门槛。
+          #    这与 SUS_PATH / SUS_KSTAT / SUS_MAP 本来的生效范围一致，隐藏能力不受影响。
+          #
+          # 2) SUS_MOUNT -> HyperOS 自带 Flutter 应用（桌面/小爱）Vulkan 引擎创建失败
+          #    根因：它给 ksu 域创建的挂载分配高位 mnt_id，读侧
+          #    fs/proc_namespace.c 里 "if (r->mnt_id >= DEFAULT_KSU_MNT_ID) return 0;"
+          #    把这些挂载从所有非 su 进程的 mountinfo 中隐藏。
+          #    设备上 adreno_gpu_driver 模块往 /vendor/lib64 覆盖挂载了一套新版 GPU 驱动
+          #    （libgsl.so 401904B / vulkan.adreno.so 7040329B，两者自洽、均无
+          #     gsl_syncobj_external_signal），而真原厂是 2284152B / 5350296B，
+          #    原厂 vulkan 引用该符号、原厂 libgsl 导出该符号。
+          #    覆盖挂载被隐藏后，应用解析出「原厂 vulkan + 模块 libgsl」的混搭组合，
+          #    于是 dlopen 报 cannot locate symbol gsl_syncobj_external_signal。
+          #    解决：停用该冗余模块（同一份驱动已由 com.qualcomm.qti.gpudrivers.sun.api35
+          #    可更新驱动 APK 提供），内核侧无需改动。已实测 SUS_MOUNT=y 时三项错误归零。
           SUSFS_CONFIGS=(
             CONFIG_KSU_SUSFS
             CONFIG_KSU_SUSFS_SUS_PATH
+            CONFIG_KSU_SUSFS_SUS_MOUNT
             CONFIG_KSU_SUSFS_SUS_KSTAT
+            CONFIG_KSU_SUSFS_SPOOF_UNAME
             CONFIG_KSU_SUSFS_ENABLE_LOG
             CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
             CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
@@ -1550,11 +1566,9 @@ jobs:
             CONFIG_KSU_SUSFS_SUS_MAP
           )
 
-          # 这些子选项在 Kconfig 里都是 default y，不写 "is not set" 就关不掉。
-          SUSFS_BISECT_OFF=(
-            CONFIG_KSU_SUSFS_SUS_MOUNT
-            CONFIG_KSU_SUSFS_SPOOF_UNAME
-          )
+          # 全特性开启，本轮不关闭任何子选项。
+          # 这些子选项在 Kconfig 里都是 default y，若需关闭必须显式写 "is not set"。
+          SUSFS_BISECT_OFF=()
 
           # 清理本步负责的配置项，避免重跑时重复或残留不受支持的选项。
           for SYMBOL in "${SUSFS_CONFIGS[@]}" "${SUSFS_BISECT_OFF[@]}" CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER; do
@@ -1575,7 +1589,11 @@ jobs:
 
           # 显式关闭（default y 的子选项必须这样写；且 bazel 分支只捞新增行，
           # 删除已有行不会进 ksu.fragment，只有追加的 "is not set" 才会生效）
-          printf '# %s is not set\n' "${SUSFS_BISECT_OFF[@]}" >> "$DEFCONFIG"
+          if [ ${#SUSFS_BISECT_OFF[@]} -gt 0 ]; then
+            printf '# %s is not set\n' "${SUSFS_BISECT_OFF[@]}" >> "$DEFCONFIG"
+          else
+            echo "本轮 SUSFS 子特性全部开启，无需写入 is not set"
+          fi
           echo "===== 本轮 SUSFS 配置 ====="
           grep -E 'KSU_SUSFS' "$DEFCONFIG" || true
 
@@ -1698,6 +1716,58 @@ jobs:
             sed -i '1i #pragma clang diagnostic ignored "-Wunused-function"' "$SUSFS_C"
             echo "已屏蔽 susfs.c 的 unused-function 告警"
           fi
+
+      - name: 限制 SPOOF_UNAME 只作用于应用进程
+        if: inputs.enable_susfs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("common/kernel/sys.c")
+          if not p.is_file():
+              raise SystemExit("未找到 kernel/sys.c")
+          src = p.read_text()
+
+          # SUSFS 原版对 newuname 的所有调用者一律改写。
+          # perf HAL / system_server 等非应用进程靠 uname() 识别 target，
+          # 被改写后 Target Init 永不完成 -> WMS.systemBooted() 走不到 -> 卡开机动画。
+          # 这里加 uid >= 10000 门槛，与 SUS_PATH / SUS_KSTAT / SUS_MAP 的生效范围保持一致：
+          # 应用侧照常拿到伪装串（隐藏能力不变），系统侧看到真实串。
+          pat = re.compile(
+              r"if \(static_branch_likely\(&susfs_is_uname_spoof_buffer_set\)\)"
+              r"(\s*\n\s*)susfs_spoof_uname\(&tmp\);"
+          )
+          m = pat.search(src)
+          if not m:
+              if "susfs_is_uname_spoof_buffer_set" not in src:
+                  print("kernel/sys.c 无 SPOOF_UNAME hook（该特性可能未启用），跳过")
+                  raise SystemExit(0)
+              raise SystemExit("找到 uname spoof 变量但未匹配到 hook 语句，需人工核对")
+
+          if "current_uid().val >= 10000" in src[m.start():m.end() + 200]:
+              print("已存在 uid 门槛，跳过")
+              raise SystemExit(0)
+
+          gap = m.group(1)
+          repl = (
+              "if (static_branch_likely(&susfs_is_uname_spoof_buffer_set) &&"
+              + gap + "    current_uid().val >= 10000)"
+              + gap + "susfs_spoof_uname(&tmp);"
+          )
+          new = src[:m.start()] + repl + src[m.end():]
+
+          if "#include <linux/cred.h>" not in new:
+              new = new.replace("#include <linux/syscalls.h>",
+                                "#include <linux/syscalls.h>\n#include <linux/cred.h>", 1)
+              if "#include <linux/cred.h>" not in new:
+                  raise SystemExit("无法确保 cred.h 已包含")
+
+          p.write_text(new)
+          print("已为 SPOOF_UNAME 加上 uid >= 10000 门槛")
+          i = new.index("susfs_is_uname_spoof_buffer_set")
+          print(new[max(0, i - 260):i + 320])
+          PY
 
       - name: 修复 SUSFS 破坏 SELinux 状态页序列号
         if: inputs.enable_susfs
