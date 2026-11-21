@@ -1532,21 +1532,30 @@ jobs:
       - name: 添加 SUSFS 配置
         if: inputs.enable_susfs
         run: |
+          # 【实验性二分】只保留对 uid>=10000 的 app 生效的特性。
+          # system_server 是 uid 1000，vendor HAL 更低，下列全进程特性才可能影响启动路径：
+          #   SUS_MOUNT(non-su processes) / SPOOF_UNAME(all) /
+          #   HIDE_KSU_SUSFS_SYMBOLS(all) / SPOOF_CMDLINE_OR_BOOTCONFIG(all)
+          # 本轮全部关闭，用于判定启动阻塞是否落在这一组。
           SUSFS_CONFIGS=(
             CONFIG_KSU_SUSFS
             CONFIG_KSU_SUSFS_SUS_PATH
-            CONFIG_KSU_SUSFS_SUS_MOUNT
             CONFIG_KSU_SUSFS_SUS_KSTAT
-            CONFIG_KSU_SUSFS_SPOOF_UNAME
             CONFIG_KSU_SUSFS_ENABLE_LOG
-            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
             CONFIG_KSU_SUSFS_OPEN_REDIRECT
             CONFIG_KSU_SUSFS_SUS_MAP
           )
 
+          # 这些子选项在 Kconfig 里都是 default y，不写 "is not set" 就关不掉。
+          SUSFS_BISECT_OFF=(
+            CONFIG_KSU_SUSFS_SUS_MOUNT
+            CONFIG_KSU_SUSFS_SPOOF_UNAME
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          )
+
           # 清理本步负责的配置项，避免重跑时重复或残留不受支持的选项。
-          for SYMBOL in "${SUSFS_CONFIGS[@]}" CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER; do
+          for SYMBOL in "${SUSFS_CONFIGS[@]}" "${SUSFS_BISECT_OFF[@]}" CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER; do
             sed -i "/^[[:space:]]*${SYMBOL}=/d; /^[[:space:]]*# ${SYMBOL} is not set$/d" "$DEFCONFIG"
           done
 
@@ -1561,6 +1570,12 @@ jobs:
 
           LINES_BEFORE=$(wc -l < "$DEFCONFIG")
           printf '%s=y\n' "${SUSFS_CONFIGS[@]}" >> "$DEFCONFIG"
+
+          # 显式关闭（default y 的子选项必须这样写；且 bazel 分支只捞新增行，
+          # 删除已有行不会进 ksu.fragment，只有追加的 "is not set" 才会生效）
+          printf '# %s is not set\n' "${SUSFS_BISECT_OFF[@]}" >> "$DEFCONFIG"
+          echo "===== 本轮 SUSFS 配置 ====="
+          grep -E 'KSU_SUSFS' "$DEFCONFIG" || true
 
           # 把本步实际追加的行导出为配置片段，随 SUSFS 集成补丁一起分发
           if [ "$SUSFS_PATCH_EXPORT" = "true" ] && [ -d "$GITHUB_WORKSPACE/susfs-patch" ]; then
