@@ -1532,25 +1532,27 @@ jobs:
       - name: 添加 SUSFS 配置
         if: inputs.enable_susfs
         run: |
-          # 【第二轮】上一轮关闭全部 4 个全进程特性后启动成功（bc=1、PERFHAL=0）。
-          # 本轮只保留 SPOOF_UNAME 关闭，恢复其余 3 个，用于确认单一根因。
-          # 依据：SPOOF_UNAME 只 hook newuname，不影响 /proc/version；
-          # 高通 perf HAL 用 uname() 识别 target，串不对则 Target Init 永不完成。
+          # 【第三轮】启动阻塞已由关闭 SPOOF_UNAME 解决。
+          # 新问题：HyperOS 自带 Flutter/Rust 应用（桌面、小爱）引擎创建失败
+          #   android_shell_holder.cc: Created PlatformViewAndroid is invalid
+          #   once_cell::imp::initialize_or_wait -> park（懒初始化永久阻塞）
+          # 本轮只保留 SUSFS 核心 hook，关闭全部子特性，
+          # 用于判定问题出在核心 hook 还是某个可选特性。
           SUSFS_CONFIGS=(
             CONFIG_KSU_SUSFS
-            CONFIG_KSU_SUSFS_SUS_PATH
-            CONFIG_KSU_SUSFS_SUS_MOUNT
-            CONFIG_KSU_SUSFS_SUS_KSTAT
             CONFIG_KSU_SUSFS_ENABLE_LOG
-            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-            CONFIG_KSU_SUSFS_OPEN_REDIRECT
-            CONFIG_KSU_SUSFS_SUS_MAP
           )
 
           # 这些子选项在 Kconfig 里都是 default y，不写 "is not set" 就关不掉。
           SUSFS_BISECT_OFF=(
+            CONFIG_KSU_SUSFS_SUS_PATH
+            CONFIG_KSU_SUSFS_SUS_MOUNT
+            CONFIG_KSU_SUSFS_SUS_KSTAT
             CONFIG_KSU_SUSFS_SPOOF_UNAME
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT
+            CONFIG_KSU_SUSFS_SUS_MAP
           )
 
           # 清理本步负责的配置项，避免重跑时重复或残留不受支持的选项。
