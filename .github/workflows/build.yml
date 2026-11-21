@@ -1716,6 +1716,66 @@ jobs:
               raise SystemExit("status.c 仍残留 ksu 域判断，修复不完整")
           PY
 
+      - name: 修复 SUSFS 阻止 SELinux 策略序列号递增
+        if: inputs.enable_susfs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("common/security/selinux/ss/services.c")
+          if not p.is_file():
+              raise SystemExit("未找到 selinux/ss/services.c")
+          src = p.read_text()
+          # SUSFS 在 selinux_policy_commit() 与 security_set_bools() 中，
+          # 于 ksu 域内 goto bypass_orig，跳过 latest_granting++，
+          # 使策略序列号停滞，userspace 的策略生效判断永远停留在旧值。
+          # 只删除含 goto bypass_orig; 的块与失效标签，其余 SUSFS 代码保留。
+          lines = src.split("\n")
+          out = []
+          i = 0
+          nb = nl = 0
+          while i < len(lines):
+              if lines[i].strip() == "#ifdef CONFIG_KSU_SUSFS":
+                  j = i + 1
+                  depth = 1
+                  while j < len(lines):
+                      s = lines[j].strip()
+                      if s.startswith("#ifdef") or s.startswith("#ifndef") or s.startswith("#if "):
+                          depth += 1
+                      elif s.startswith("#endif"):
+                          depth -= 1
+                          if depth == 0:
+                              break
+                      j += 1
+                  if j < len(lines):
+                      body = "\n".join(lines[i + 1:j])
+                      if "goto bypass_orig;" in body:
+                          nb += 1
+                          i = j + 1
+                          continue
+                      if body.strip() == "bypass_orig:":
+                          nl += 1
+                          i = j + 1
+                          continue
+              out.append(lines[i])
+              i += 1
+          new = "\n".join(out)
+          print(f"removed blocks = {nb}, labels = {nl}")
+          if nb == 0 and nl == 0:
+              print("services.c 未发现 SUSFS 序列号 bypass，跳过")
+          else:
+              p.write_text(new)
+          if "bypass_orig" in new:
+              raise SystemExit("services.c 仍残留 bypass_orig，修复不完整")
+          inc = new.count("newpolicy->latest_granting = oldpolicy->latest_granting + 1;")
+          print(f"latest_granting increment sites = {inc}")
+          if inc < 2:
+              raise SystemExit("latest_granting 递增点少于 2，修复异常")
+          if "extern bool susfs_is_current_ksu_domain(void);" not in new:
+              raise SystemExit("extern 声明被误删")
+          PY
+
       - name: 编译内核
         id: compile_kernel
         uses: nick-fields/retry@v4
