@@ -1682,6 +1682,40 @@ jobs:
             echo "已屏蔽 susfs.c 的 unused-function 告警"
           fi
 
+      - name: 修复 SUSFS 破坏 SELinux 状态页序列号
+        if: inputs.enable_susfs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("common/security/selinux/status.c")
+          if not p.is_file():
+              raise SystemExit("未找到 selinux/status.c")
+          src = p.read_text()
+          # SUSFS 在 ksu 域内提前 return，跳过 status->sequence++，
+          # 破坏 seqlock 语义，导致 userspace 永远看不到策略更新（黑屏根因）。
+          pat = re.compile(
+              r"#ifdef CONFIG_KSU_SUSFS\n"
+              r"\s*if \(susfs_is_current_ksu_domain\(\)\) \{.*?\n\s*\}\n"
+              r"#endif[^\n]*\n",
+              re.S,
+          )
+          new, n = pat.subn("", src)
+          if n == 0:
+              print("status.c 未发现 SUSFS 提前返回块，跳过")
+          else:
+              # 同时移除随之无用的 extern 声明
+              new = new.replace(
+                  "#ifdef CONFIG_KSU_SUSFS\nextern bool susfs_is_current_ksu_domain(void);\n#endif // #ifdef CONFIG_KSU_SUSFS\n",
+                  "",
+              )
+              p.write_text(new)
+              print(f"已移除 {n} 处破坏 sequence 的提前返回块")
+          if "susfs_is_current_ksu_domain" in new:
+              raise SystemExit("status.c 仍残留 ksu 域判断，修复不完整")
+          PY
+
       - name: 编译内核
         id: compile_kernel
         uses: nick-fields/retry@v4
