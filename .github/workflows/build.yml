@@ -1696,46 +1696,17 @@ jobs:
             fi
           fi
 
-      - name: 让 selinux_hide 走 BakaSU 备份策略实现
-        if: inputs.enable_susfs
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          set -euo pipefail
-          # Duck Detector 实测：selinux_hide 显示 enabled/running，但对应用完全空转。
-          #   uid 10464 写 u:r:ksu:s0 到 /sys/fs/selinux/context  -> 成功（应为 EINVAL）
-          #   uid 10464 写哨兵类型                                 -> EINVAL（对照正常）
-          #   untrusted_app -> ksu_file / lsposed_file:file read   -> Allowed
-          #   system_server -> system_server:process execmem       -> Allowed
-          #
-          # 根因是 BakaSU 与本版 SUSFS 的集成缺陷：
-          #   kernel/tools/susfs_compat.mk 只要 grep 到 hooks.c 里有
-          #   ksu_selinux_hide_running，就定义 KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE，
-          #   于是 BakaSU 把自己那套基于 backup_sepolicy 的实现整段编译掉，改用 SUSFS 的
-          #   inline hook。但本版 SUSFS 的 susfs_security_compute_av_user /
-          #   susfs_security_context_to_sid_core 取的是
-          #   rcu_dereference(selinux_state.policy) —— 当前生效的脏策略，
-          #   而不是施加 KSU 规则之前的原厂备份，所以查出来当然还是 allowed。
-          #
-          # 修法：让该 compat 宏不被定义，BakaSU 就会编译并安装自己的实现
-          #   （selinux_hide.c L767-791 直接改写 write_op[SEL_CONTEXT]/[SEL_ACCESS]，
-          #    覆盖 SUSFS 的 wrapper，且全部走 backup_sepolicy）。
-          #   CONFIG_KALLSYMS_ALL=y 已确认，find_kernel_symbol_exact("write_op") 可解析。
-          #   SUSFS 在 hooks.c 里对 setxattr/setprocattr 的隐藏仍照常工作，
-          #   因为它们只读 ksu_selinux_hide_running，而该变量仍由 BakaSU 置位。
-          # 失败兜底：若 write_op 解析不到，enable 返回错误、running=false，
-          #   退回当前状态，不影响开机。
-          MK="$PWD/KernelSU/kernel/tools/susfs_compat.mk"
-          if [ ! -f "$MK" ]; then
-            echo "未找到 susfs_compat.mk，跳过"
-            exit 0
-          fi
-          if ! grep -q 'grep -q "ksu_selinux_hide_running"' "$MK"; then
-            echo "susfs_compat.mk 已处理或结构不同，跳过"
-            exit 0
-          fi
-          sed -i 's/grep -q "ksu_selinux_hide_running"/grep -q "ksu_selinux_hide_running_BAKASU_NATIVE_ONLY"/' "$MK"
-          echo "===== 处理后的 selinux_hide compat 判定 ====="
-          grep -n -A2 'selinux_hide' "$MK" || true
+      # 注意：这里曾有一步「让 selinux_hide 走 BakaSU 备份策略实现」，
+      # 通过改 susfs_compat.mk 使 KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE 不被定义。
+      # 该做法已证实会导致 vmlinux 链接失败（r7 / run 44934445437）：
+      #   selinux_hide.c L49-53 用 __maybe_static 控制符号可见性，宏一旦不定义，
+      #   ksu_selinux_hide_running / fake_status / initialize_fake_status /
+      #   fake_status_initialize_key 全部变 static，被 ThinLTO 私有化；
+      #   而 SUSFS 补丁在 hooks.c、selinuxfs.c 里仍无条件 extern 引用它们，
+      #   于是出现「同名符号 defined in vmlinux.o 却 undefined」的链接错误。
+      # 结论：该宏必须保持定义。selinux_hide 空转问题要改 SUSFS 侧的策略取值，
+      #   不能靠关宏来回退到 BakaSU 原生实现。
+      # 详见 docs/haotian-hyperos4-susfs-notes.md。
 
       - name: 修复 KSU 侧 SUSFS 声明与未使用告警
         if: inputs.enable_susfs
