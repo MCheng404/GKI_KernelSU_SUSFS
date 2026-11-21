@@ -1532,26 +1532,25 @@ jobs:
       - name: 添加 SUSFS 配置
         if: inputs.enable_susfs
         run: |
-          # 【实验性二分】只保留对 uid>=10000 的 app 生效的特性。
-          # system_server 是 uid 1000，vendor HAL 更低，下列全进程特性才可能影响启动路径：
-          #   SUS_MOUNT(non-su processes) / SPOOF_UNAME(all) /
-          #   HIDE_KSU_SUSFS_SYMBOLS(all) / SPOOF_CMDLINE_OR_BOOTCONFIG(all)
-          # 本轮全部关闭，用于判定启动阻塞是否落在这一组。
+          # 【第二轮】上一轮关闭全部 4 个全进程特性后启动成功（bc=1、PERFHAL=0）。
+          # 本轮只保留 SPOOF_UNAME 关闭，恢复其余 3 个，用于确认单一根因。
+          # 依据：SPOOF_UNAME 只 hook newuname，不影响 /proc/version；
+          # 高通 perf HAL 用 uname() 识别 target，串不对则 Target Init 永不完成。
           SUSFS_CONFIGS=(
             CONFIG_KSU_SUSFS
             CONFIG_KSU_SUSFS_SUS_PATH
+            CONFIG_KSU_SUSFS_SUS_MOUNT
             CONFIG_KSU_SUSFS_SUS_KSTAT
             CONFIG_KSU_SUSFS_ENABLE_LOG
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
             CONFIG_KSU_SUSFS_OPEN_REDIRECT
             CONFIG_KSU_SUSFS_SUS_MAP
           )
 
           # 这些子选项在 Kconfig 里都是 default y，不写 "is not set" 就关不掉。
           SUSFS_BISECT_OFF=(
-            CONFIG_KSU_SUSFS_SUS_MOUNT
             CONFIG_KSU_SUSFS_SPOOF_UNAME
-            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
           )
 
           # 清理本步负责的配置项，避免重跑时重复或残留不受支持的选项。
