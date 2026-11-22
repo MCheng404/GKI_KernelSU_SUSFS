@@ -459,6 +459,60 @@ SUSFS 能覆盖的是**另一半**：直接 `stat /data/app/...`、探测 `/data
 
 剩下的两条（ADB Runtime、System Properties）是纯「调试态」问题：`persist.sys.usb.config=adb` + `settings get global adb_enabled=1` + `init.svc.adbd=running`。关掉 USB 调试即同时消掉这两条。
 
+### HMA-OSS 自带无障碍/调试隐藏，不需要改源码
+
+查过源码后确认，`zygote/src/main/java/.../hook/AccessibilityHook.kt` 已经做了：
+
+```kotlin
+hookBefore(ACCESSIBILITY_SERVICE_CLASS, "getEnabledAccessibilityServiceList") { ... 返回空表 ... }
+hookBefore(ACCESSIBILITY_SERVICE_CLASS, "addClient") { ... 返回 0 ... }
+private fun callerIsSpoofed(caller: String) =
+    getEnabledSettingsPresets(caller).contains(AccessibilityPreset.NAME)
+```
+
+（`ACCESSIBILITY_SERVICE_CLASS = com.android.server.accessibility.AccessibilityManagerService`，即 hook 在 system_server 侧按调用方过滤。）
+
+开关是**设置预设**，不是应用预设，写在每个应用的 `applySettingsPresets` 里：
+
+| 预设名 | 替换内容 |
+| --- | --- |
+| `accessibility` | `Settings.Secure.ACCESSIBILITY_ENABLED=0`、`ENABLED_ACCESSIBILITY_SERVICES=""` |
+| `dev_options` | `adb_enabled=0`、`adb_wifi_enabled=0`、`development_settings_enabled=0`、`allow_mock_location=0` |
+| `input_method` | 默认输入法与 TTS 合成器 |
+
+之前只加了应用预设（`accessibility_apps` 那类是「哪些 app 被发现」的名单），设置预设是空的，所以 AccessibilityHook 对这个调用方根本没生效——这才是「Scene 从 PM 里消失、却还能被无障碍探针看见」的真正原因，不是 HMA 能力不足。
+
+补上 `"applySettingsPresets": ["accessibility","dev_options"]` 并把 `extraOppositeAppList` 清空（Scene 重新隐掉）后实测：
+
+- Dangerous Apps：`Hits: 0 | Hidden: 0`，卡片直接从榜上消失；
+- LSPosed：28 → 0，降级为「reduced coverage」Info；
+- ADB Runtime 里 `USB debugging setting: Disabled`（说明 `dev_options` 生效了），但卡片仍是 Warning，因为 `init.svc.adbd: running` 与 `persist.sys.usb.config=adb` 是**系统属性**，不走 Settings Provider，HMA 那层 ContentProvider hook 够不着。
+
+### KernelSU 的 throne hunt：内核侧痕迹，HMA 盖不住
+
+同一份报告里偶发出现 `Native Root — KernelSU throne hunt: open=3 access=3`（复扫一次又变 Clean，属于竞态）。检测逻辑是：应用用零权限路径把 `/data/system/packages.list` 重写一次，等 KSU 的 fsnotify 反应，再用 inotify 盯自己的 `/data/app/<pkg>` 目录，看 KSU 有没有来打开它。
+
+本机实现（`KernelSU/kernel/manager/pkg_observer.c:32`）：
+
+```c
+static void ksu_handle_inode_event(...) {
+    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+        pr_info("packages.list detected: %d\n", mask);
+        ksu_defer_track_throne();          // → track_throne(TRACK_THRONE_FORCE_SYNCHRONOUS)
+    }
+}
+```
+
+`do_track_throne()` 里不带 `TRACK_THRONE_PRUNE_ONLY` 时，会**无条件**执行 `search_manager("/data/app", 2, &uid_list)`（`throne_tracker.c:350`），逐个 `ksu_filp_open_nonotify` 打开 `/data/app/*/*` 目录——这就是应用 inotify 看到的那几次 open/access。
+
+6.6 内核上安装检测本来就走 `ksu_handle_rename` 那条 renameat 路径（`< 6.8 && !CONFIG_KSU_TRACEPOINT_HOOK`），packages.list 这条只是补充。所以把这个事件降级成「只剪枝、不搜索」即可闭掉该向量：
+
+```c
+track_throne(TRACK_THRONE_FORCE_SYNCHRONOUS | TRACK_THRONE_PRUNE_ONLY);
+```
+
+代价：`packages.list` 变动不再触发管理器重扫，卸载后的 allowlist 裁剪照旧；新装管理器的识别依赖 renameat 路径与开机扫描，不受影响。
+
 ---
 
 ## 八、NFQUEUE：原厂已全开，不需要改内核
