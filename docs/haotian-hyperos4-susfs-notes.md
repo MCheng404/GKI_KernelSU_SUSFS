@@ -270,11 +270,44 @@ ld.lld: error: undefined symbol: fake_status_initialize_key
 
 **结论：`KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE` 必须保持定义。** 该 step 已从 `build.yml` 移除，并在原处留注释说明。
 
-### 4.4 正确方向（尚未实施）
+### 4.4 正确修法（已实施，待刷机验证）
 
-保持宏定义，改 **SUSFS 侧的策略取值**：让 `susfs_security_compute_av_user` / `susfs_security_context_to_sid_core` 在「`ksu_selinux_hide_running` 且 uid ≥ 10000」时改用 BakaSU 的 `backup_sepolicy`，而不是 `selinux_state.policy`。宏定义时相关符号本就是全局可见的，不存在链接问题。
+保持宏定义，改 **SUSFS 侧的策略取值**。`build.yml` 步骤「让 selinux_hide 真正查 BakaSU 备份策略」在 `common/security/selinux/ss/services.c` 中插入：
 
-相关源码位置：`kernel/feature/selinux_hide.c`（`backup_sepolicy` 由 `kernel/policy/rules.c` 的 `ksu_dup_sepolicy(old_pol)` 生成）、`kernel/hook/boot_event.c` 的 `ksu_selinux_hide_drop_backup_if_unused()`。
+```c
+extern bool ksu_selinux_hide_running;
+extern struct selinux_policy *backup_sepolicy;
+
+static inline struct selinux_policy *susfs_hide_policy(void)
+{
+	struct selinux_policy *live = rcu_dereference(selinux_state.policy);
+
+	if (current_uid().val >= 10000 && ksu_selinux_hide_running &&
+	    backup_sepolicy)
+		return backup_sepolicy;
+	return live;
+}
+```
+
+并把 `susfs_security_context_to_sid_core` 与 `susfs_security_compute_av_user` 里各自的
+
+```c
+policy = rcu_dereference(selinux_state.policy);
+```
+
+换成 `policy = susfs_hide_policy();`。**只改这两处**，原厂同名函数里的取值行不动。
+
+为什么这样是安全的：
+
+- 宏保持定义 → `ksu_selinux_hide_running` 与 `backup_sepolicy` 都是全局非 static，**不会重蹈 4.3 的链接失败**。`backup_sepolicy` 定义在 `kernel/selinux/rules.c`，6.6（≥ 5.10）分支必然编译。
+- 门控与 SUSFS 原有的 `handle_sel_write_context` / `handle_sel_write_access` 一致（uid ≥ 10000 且 running），系统服务路径完全不受影响。
+- `backup_sepolicy` 只在 `!ksu_selinux_hide_running` 时被 `ksu_selinux_hide_drop_backup_if_unused()` 释放并置 NULL，与这里先判 `running` 的顺序一致——**与 BakaSU 原生实现的用法相同**（同样存在理论上的切换竞态，不是本改动引入的）。
+- `backup_sepolicy->sidtab` 是新建并 `policydb_load_isids` 过的真实 sidtab，只含 initial SID；合法上下文会按需插入并正常解析，而 `u:r:ksu:s0` 这类**原厂不存在的类型会返回 `-EINVAL`**——正是检测方期望看到的结果。
+- 任一前提不满足（文件缺失 / SUSFS 未补丁 / KSU 无该符号）整步跳过，退回当前行为，不影响开机。
+
+该步骤的补丁逻辑已用含「诱饵取值行」的样本离线验证：helper 恰好插入一次、恰好替换两处、原厂函数未被误改、重复执行幂等。
+
+**尚未验证**：刷机后 `selinux_hide` 是否真的对应用生效，需重跑 4.1 的探针与检测应用复测。
 
 ---
 

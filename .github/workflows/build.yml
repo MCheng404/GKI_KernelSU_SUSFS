@@ -1708,6 +1708,103 @@ jobs:
       #   不能靠关宏来回退到 BakaSU 原生实现。
       # 详见 docs/haotian-hyperos4-susfs-notes.md。
 
+      - name: 让 selinux_hide 真正查 BakaSU 备份策略
+        if: inputs.enable_susfs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          # Duck Detector 实测：selinux_hide 显示 enabled/running，但对应用完全空转。
+          #   uid 10464 写 u:r:ksu:s0 到 /sys/fs/selinux/context -> 成功（本应 EINVAL）
+          #   untrusted_app -> ksu_file / lsposed_file:file read -> Allowed
+          #
+          # 根因：SUSFS 的 susfs_security_context_to_sid_core /
+          #   susfs_security_compute_av_user 取的是 rcu_dereference(selinux_state.policy)，
+          #   即施加过 KSU 规则的「脏」策略，而不是原厂备份，所以查出来当然 allowed。
+          #   门控本身没问题（handle_sel_write_context/access 已判 uid>=10000 && running）。
+          #
+          # 修法：保持 KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE 定义（关它会链接失败，
+          #   见上方注释），只把这两处的策略取值换成 BakaSU 的 backup_sepolicy。
+          #   backup_sepolicy 在 6.6（>=5.10）分支是全局非 static，且宏定义时
+          #   ksu_selinux_hide_running 也是全局，链接期没有问题。
+          #   它只在 !ksu_selinux_hide_running 时被 drop_backup_if_unused 释放并置 NULL，
+          #   与这里先判 running 的顺序一致（与 BakaSU 原生实现的用法相同）。
+          # 兜底：任一前提不满足就整步跳过，退回当前行为，不影响开机。
+          SVC="$PWD/common/security/selinux/ss/services.c"
+          if [ ! -f "$SVC" ]; then
+            echo "未找到 ss/services.c，跳过"
+            exit 0
+          fi
+          if ! grep -q 'susfs_security_compute_av_user' "$SVC"; then
+            echo "SUSFS 未补丁 services.c，跳过"
+            exit 0
+          fi
+          if ! grep -rq 'struct selinux_policy \*backup_sepolicy;' "$PWD/KernelSU/kernel"; then
+            echo "KernelSU 未提供 backup_sepolicy（非 >=5.10 分支？），跳过"
+            exit 0
+          fi
+          python3 - "$SVC" <<'PY'
+          import sys
+
+          path = sys.argv[1]
+          src = open(path, encoding="utf-8").read()
+
+          if "susfs_hide_policy" in src:
+              print("已处理过，跳过")
+              sys.exit(0)
+
+          helper = (
+              "/* added by build.yml: query BakaSU pre-KSU backup policy when hiding */\n"
+              "extern bool ksu_selinux_hide_running;\n"
+              "extern struct selinux_policy *backup_sepolicy;\n"
+              "\n"
+              "static inline struct selinux_policy *susfs_hide_policy(void)\n"
+              "{\n"
+              "\tstruct selinux_policy *live = rcu_dereference(selinux_state.policy);\n"
+              "\n"
+              "\tif (current_uid().val >= 10000 && ksu_selinux_hide_running &&\n"
+              "\t    backup_sepolicy)\n"
+              "\t\treturn backup_sepolicy;\n"
+              "\treturn live;\n"
+              "}\n"
+              "\n"
+          )
+
+          anchor = "static int susfs_security_context_to_sid_core("
+          i = src.find(anchor)
+          if i < 0:
+              raise SystemExit("找不到 susfs_security_context_to_sid_core，放弃")
+          src = src[:i] + helper + src[i:]
+
+          old = "policy = rcu_dereference(selinux_state.policy);"
+          new = "policy = susfs_hide_policy();"
+          patched = 0
+          for fn in (anchor, "void susfs_security_compute_av_user("):
+              j = src.find(fn)
+              if j < 0:
+                  raise SystemExit("找不到 " + fn)
+              k = src.find(old, j)
+              if k < 0:
+                  raise SystemExit(fn + " 内未找到策略取值行")
+              src = src[:k] + new + src[k + len(old):]
+              patched += 1
+
+          if patched != 2:
+              raise SystemExit("策略取值替换数不为 2，放弃")
+
+          if "#include <linux/cred.h>" not in src:
+              lines = src.split("\n")
+              for n, line in enumerate(lines):
+                  if line.startswith("#include"):
+                      lines.insert(n, "#include <linux/cred.h>")
+                      break
+              src = "\n".join(lines)
+
+          open(path, "w", encoding="utf-8").write(src)
+          print("已替换策略取值处数:", patched)
+          PY
+          echo "===== 校验 ====="
+          grep -n 'susfs_hide_policy' "$SVC"
+
       - name: 修复 KSU 侧 SUSFS 声明与未使用告警
         if: inputs.enable_susfs
         working-directory: ${{ env.KERNEL_ROOT }}
