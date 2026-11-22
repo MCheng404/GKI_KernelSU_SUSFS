@@ -387,9 +387,11 @@ CMD_SUSFS_ADD_SUS_PATH -> ret: 0
 
 ---
 
-## 七、HMA-OSS 与 SUSFS 不兼容（独立问题，已坐实）
+## 七、HMA-OSS 与 SUSFS：先冲突，后共存（附检测器实测）
 
-### 现象
+### 历史冲突（r9 及更早）
+
+现象
 
 `zygote64` 每秒一次 `signal 6 SIGABRT`，`Abort message: '!(fd != -1)'`，`Process uptime: 1s`。
 
@@ -405,6 +407,10 @@ ELF 解析 `hma_oss_zygisk/zygisk/arm64-v8a.so`（13480 B）三项精确吻合�
 
 → `fd = -1` → abort。移除 / 禁用 HMA 后 tombstone 归零。
 
+### 现状（r10 实测）：已共存
+
+`sus_kstat` / `open_redirect` / `sus_map` 三个列表留空后，上述三条干扰路径全部不生效，冲突条件不再成立。r10 上 `hma_oss_zygisk`（version `oss-177`）正常加载，`/data/misc/hide_my_applist_<随机>/runtime.log` 持续输出 `PmsHookTarget34 @shouldFilterApplication`，tombstone 为 0。**结论修正：不是架构冲突，是「SUSFS 隐藏列表非空」这个条件才触发的问题。**
+
 ### SUSFS 能不能替代 HMA？**架构上不能**
 
 - HMA 拦的是 **PackageManager API 结果**，数据由 **system_server（uid 1000）经 Binder** 从内存包注册表返回，调用方进程**不碰文件系统**。
@@ -417,9 +423,41 @@ SUSFS 能覆盖的是**另一半**：直接 `stat /data/app/...`、探测 `/data
 
 ### 可能的替代路线（未实测）
 
-原版 HMA `com.tsng.hidemyapplist`（Dr-TSNG）自 **V3.0.6 起是纯 Xposed 模块**，发布说明原文「不再需要 Magisk 模块，请将其卸载，否则会卡开机」，靠 LSPosed 在目标进程 hook PackageManager，**不经过 ZygoteLoader**，理论上绕开本冲突。
+原版 HMA `com.tsng.hidemyapplist`（Dr-TSNG）自 **V3.0.6 起是纯 Xposed 模块**，发布说明原文「不再需要 Magisk 模块，请将其卸载，否则会卡开机」，靠 LSPosed 在目标进程 hook PackageManager，**不经过 ZygoteLoader**，理论上绕开本冲突（本机现有 HMA-OSS 为 Zygisk 版 `org.frknkrc44.hma_oss`，走的是 ZygoteLoader）。
 
 风险：原版**已停止更新**，Android 17 / API 37 兼容性无实测保证；framework hook 本身留 Xposed 痕迹，属于「用一种检测面换另一种」。
+
+### 检测器侧的真实代价（Duck Detector 实测）
+
+隐藏装得再好，也会被交叉验证抓出来。HMA-OSS 的配置在 `/data/misc/hide_my_applist_<随机>/config.json`，`scope` 按目标应用分开；给 `com.eltavine.duckdetector` 套上 `xposed / root_apps / custom_rom / accessibility_apps` 等预设后：
+
+| 指标 | 开 HMA 前 | 开 HMA（默认全隐） | 开 HMA + 修正 |
+| --- | --- | --- | --- |
+| 汇总 | 1 DANGER / 7 WARNING | **2 DANGER** / 3 WARNING | 1 DANGER / 5 WARNING |
+| PackageManager 可见包 | 542 | 440 | 441 |
+| Dangerous Apps 命中 | 6（Warning） | 1 + "HMA-style concealment"（DANGER） | 1（Warning） |
+| LSPosed 残留 | 28 | 隐藏后降级为 Info | 1 |
+| Root Managers / Native Root | Warning | 降级为 Info（管理器已不可见） | Info |
+
+**触发原因是交叉验证，不是隐藏本身：** Duck Detector 拿 `PackageManager` 的结果和「直接探针」（`createPackageContext`+`ZipFile`、直接 open APK fd、`Android/data` 目录列举、无障碍服务列表）对比。预设把 Scene（`com.omarea.vtools`）从 PM 里抹掉，但它的无障碍服务 `AccessibilitySceneMode` 仍出现在系统服务列表里，于是报「1 个包被直接探针看见、却不在 PM 清单里」→ 直接判 DANGER。
+
+**修法**：在目标应用的 `scope` 里给它加一条例外，让它保持可见，两边就一致了：
+
+```json
+"scope": { "com.eltavine.duckdetector": {
+  "useWhitelist": false,
+  "extraOppositeAppList": ["com.omarea.vtools"],
+  "applyPresets": ["accessibility_apps","custom_rom","detector_apps",
+                   "root_apps","shizuku_dhizuku","sus_apps","xposed"]
+} }
+```
+
+两点必须注意：
+
+1. 配置是**开机时读**的，改完必须重启才生效（只 `force-stop` 目标应用没用）。
+2. 写回要保住属主，否则 HMA 读不到：`su -c 'cat new.json > /data/misc/hide_my_applist_*/config.json'`（用重定向而不是 `mv`，原地 inode 与 `system:system 600` 都保留）。改完再 `cat` 回来看字节数对不对。
+
+剩下的两条（ADB Runtime、System Properties）是纯「调试态」问题：`persist.sys.usb.config=adb` + `settings get global adb_enabled=1` + `init.svc.adbd=running`。关掉 USB 调试即同时消掉这两条。
 
 ---
 
