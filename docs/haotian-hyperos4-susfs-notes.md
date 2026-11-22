@@ -270,44 +270,58 @@ ld.lld: error: undefined symbol: fake_status_initialize_key
 
 **结论：`KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE` 必须保持定义。** 该 step 已从 `build.yml` 移除，并在原处留注释说明。
 
-### 4.4 正确修法（已实施，待刷机验证）
+### 4.4 正确修法（已上机验证）：只伪造探测入口，内部路径保持实时策略
 
-保持宏定义，改 **SUSFS 侧的策略取值**。`build.yml` 步骤「让 selinux_hide 真正查 BakaSU 备份策略」在 `common/security/selinux/ss/services.c` 中插入：
+**第一版（全局换策略）是错的，且已用刷机证伪。** 那版把 `susfs_security_context_to_sid_core` 与 `susfs_security_compute_av_user` 的策略取值整体换成 `backup_sepolicy`。结果：`selinux_hide=1` 时 zygote 给应用设上下文全部 `-EINVAL`，`selinux_android_setcontext` 失败 58 次、波及 10 个包，zygote 逐个 SIGABRT，system_server 被判死反复重启，卡在开机动画。
+
+根因是**作用范围**，不是策略内容：SUSFS 自己 hook 了 `security_setprocattr`，zygote 给应用设上下文正走 `hooks.c` → `susfs_security_context_to_sid()` → core；`backup_sepolicy` 的 sidtab 只有 initial SID，应用类型不在里面，必然 `-EINVAL`。
+
+定案方案（`build.yml` 步骤「让 selinux_hide 只伪造 selinuxfs 探测结果」）：
 
 ```c
 extern bool ksu_selinux_hide_running;
 extern struct selinux_policy *backup_sepolicy;
 
-static inline struct selinux_policy *susfs_hide_policy(void)
+/* core 加 hide 参数：只有探测入口传 1 */
+static int susfs_security_context_to_sid_core(..., int force, int hide)
 {
-	struct selinux_policy *live = rcu_dereference(selinux_state.policy);
+	...
+	policy = (hide && backup_sepolicy) ?
+		backup_sepolicy : rcu_dereference(selinux_state.policy);
+	...
+}
 
-	if (current_uid().val >= 10000 && ksu_selinux_hide_running &&
-	    backup_sepolicy)
-		return backup_sepolicy;
-	return live;
+/* 新增变体，仅供 selinuxfs 探测使用 */
+int susfs_security_context_to_sid_hide(...)
+{
+	return susfs_security_context_to_sid_core(..., 0, 1);
 }
 ```
 
-并把 `susfs_security_context_to_sid_core` 与 `susfs_security_compute_av_user` 里各自的
+- 三处内部包装（`_default` / `_force` / 原函数）一律 `hide=0`，`hooks.c` 的 setxattr/setprocattr 完全不受影响；
+- `selinuxfs.c` 的 `selinux_context` 写入入口改调 `_hide` 变体；
+- `susfs_security_compute_av_user` 只被 selinuxfs 的 access 入口使用，按 `current_uid().val >= 10000 && ksu_selinux_hide_running && backup_sepolicy` 门控。
 
-```c
-policy = rcu_dereference(selinux_state.policy);
-```
+**验收结果（r10 实机，`selinux_hide=1`）**
 
-换成 `policy = susfs_hide_policy();`。**只改这两处**，原厂同名函数里的取值行不动。
+| 写入主体 | 上下文 | 结果 |
+| --- | --- | --- |
+| 应用 uid 10464 | `u:r:ksu:s0` | `EINVAL`（已隐藏） |
+| 应用 uid 10464 | `u:object_r:ksu_file:s0` | `EINVAL`（已隐藏） |
+| 应用 uid 10464 | `u:object_r:lsposed_file:s0` | `EINVAL`（已隐藏） |
+| 应用 uid 10464 | `u:object_r:system_file:s0` | 接受（合法上下文正常） |
+| root uid 0 | `u:r:ksu:s0` / `ksu_file` | 接受（实时策略未被削弱） |
 
-为什么这样是安全的：
+同时：`sys.boot_completed=1`、`bootanim=stopped`、tombstone 0、`selinux_android_setcontext` 报错 0 次、Vulkan 相关报错 0 次。Duck Detector 的 SELinux 卡片由 `DANGER` 变为 `[✔ CLEAR]`（`Dangerous types: None`、`Permissive domains: None`），其原始 selinuxfs 探针对两个 KSU 上下文均记录 `errno=22`。
 
-- 宏保持定义 → `ksu_selinux_hide_running` 与 `backup_sepolicy` 都是全局非 static，**不会重蹈 4.3 的链接失败**。`backup_sepolicy` 定义在 `kernel/selinux/rules.c`，6.6（≥ 5.10）分支必然编译。
-- 门控与 SUSFS 原有的 `handle_sel_write_context` / `handle_sel_write_access` 一致（uid ≥ 10000 且 running），系统服务路径完全不受影响。
-- `backup_sepolicy` 只在 `!ksu_selinux_hide_running` 时被 `ksu_selinux_hide_drop_backup_if_unused()` 释放并置 NULL，与这里先判 `running` 的顺序一致——**与 BakaSU 原生实现的用法相同**（同样存在理论上的切换竞态，不是本改动引入的）。
-- `backup_sepolicy->sidtab` 是新建并 `policydb_load_isids` 过的真实 sidtab，只含 initial SID；合法上下文会按需插入并正常解析，而 `u:r:ksu:s0` 这类**原厂不存在的类型会返回 `-EINVAL`**——正是检测方期望看到的结果。
-- 任一前提不满足（文件缺失 / SUSFS 未补丁 / KSU 无该符号）整步跳过，退回当前行为，不影响开机。
+**补丁脚本自身的四个坑（都是实测踩出来的）**
 
-该步骤的补丁逻辑已用含「诱饵取值行」的样本离线验证：helper 恰好插入一次、恰好替换两处、原厂函数未被误改、重复执行幂等。
+1. 替换串必须**从 SUSFS core 之后**开始找，否则会命中原生 `security_context_to_sid_default/_force`（签名只有 6 个参数），编译报 `too many arguments`。
+2. 改完前面的文本后不能再复用旧偏移插入 `extern`，否则会插进 `retur` 中间变成 `returextern`。
+3. 三元表达式的另一半不能把 `policy = ...` 整句拼进去，否则得到 `policy = ... : policy = rcu_dereference(...)`，报 `expression is not assignable`。
+4. 幂等标记要用**新符号**（`susfs_security_context_to_sid_hide`），否则会和上一版补丁混淆、跳过不打。
 
-**尚未验证**：刷机后 `selinux_hide` 是否真的对应用生效，需重跑 4.1 的探针与检测应用复测。
+**探针写法**：`printf '<ctx>' | toybox dd of=/sys/fs/selinux/context bs=<len> count=1`。用 `bs=1` 会逐字节写，每次都是残片，全部 `EINVAL`，看起来像"成功隐藏"，其实是假象。
 
 ---
 
@@ -450,6 +464,7 @@ iptables -w -D OUTPUT 1           # 立即删除，回环恢复
 6. `ksu_mode` 三个选项语义反直觉：`关闭` = **启用 SUSFS**；`禁用SUSFS` = 保留 KSU；`禁用KSU` = 纯内核。
 7. `cancel_susfs=true` 会报 `SukiSU Kconfig SUSFS section missing`，不要用。
 8. 给 KSU 所有含 `susfs_` 的 `.c` 首行插 `susfs.h` 会早于 `cred.h`，导致隐式 int + array-bounds 编译崩溃。
+9. **编译步骤的重试会清空 `ksu.fragment`。** 该步骤先生成 fragment 再执行 `cp "$DEFCONFIG.orig" "$DEFCONFIG"`；一旦编译失败被 retry，第二次 `diff` 两侧已经完全相同，fragment 被改写成空文件，KSU/SUSFS/NTSYNC/NoMount 配置全丢（表现为 `ntsync.ko` modpost 报 `__vfs_setxattr_noperm undefined`）。修法：diff 先写 `$FRAG.tmp`，非空才覆盖 `$FRAG`，空的就沿用上一次生成的 fragment。
 
 ---
 
@@ -517,6 +532,35 @@ adb logcat -d -b all | grep -c "ActivityLeakMonitor.*has create"
 | **`44930971760`** | **SPOOF_UNAME 加 uid 门槛（10/10）** | **全绿，长期运行版** |
 | `44933335577` | + Networking + NTSync + Droidspaces 678 | 构建成功，未刷机验证 |
 | `44934445437` | + 关 selinux_hide compat 宏 | **链接失败**，见第四节 |
+
+---
+
+## 十三、NoMount：VFS 路径重定向（已集成并实机生效）
+
+NoMount 是 **VFS 层的路径重定向框架**，不是 mount 方案：不产生挂载项、不污染 `/proc/mounts`，注入/whiteout/opaque 全部在 RAM 里完成，用户态与内核通过 keyring（`add_key`）通信，还带 UID 隔离（把银行类/检测类应用放回原厂文件系统视图）。
+
+**集成方式**
+
+- `build.yml` 的 `use_nomount` 默认改为 `true`；步骤 30 拉取 `maxsteeel/nomount` 的 `dev` 分支（实测 `2e696f6`），建立 `common/fs/nomount -> ../NoMount/kernel/src` 软链，并注册 `fs/Makefile`、`fs/Kconfig`。
+- 追加 `CONFIG_NOMOUNT=y`，**编进 Image**（不是 LKM）。产物 `Image` 比不带 NoMount 的版本大 65536 B。
+- 本地构建要给该步骤加代理（`curl raw.githubusercontent.com` 直连不通）。
+
+**实机验证（r10，6.6.118 GKI）**
+
+```text
+[   22.765138] nomount: Injection started
+[   22.765235] nomount: loading module BuildingtheLightofHopefortheFuture
+NoMount: [DEBUG] Superblock successfully hijacked for dev: 0xfe00033
+NoMount: [DEBUG] xattr handlers successfully hijacked for dev: 0xfe00004
+NoMount: [DEBUG] Successfully hijacked VFS ops for parent dir (ino: 350)
+```
+
+即开机后子系统已接管，且设备上已安装的模块被它接走——不是把代码编进去空转。
+
+**两点提醒**
+
+- 内核侧只是子系统；要真正用起来还得刷 NoMount 元模块 zip（KSU/APatch 模块 + `nm` CLI）。
+- 它与 SUSFS 的 `sus_mount` 是两套独立的路径重定向，编译期不冲突，**运行时是否互抢 hook 需长期观察**。
 
 ---
 

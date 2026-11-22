@@ -63,7 +63,7 @@ on:
       use_nomount:
         required: false
         type: boolean
-        default: false
+        default: true
       use_networking:
         required: false
         type: boolean
@@ -1708,89 +1708,127 @@ jobs:
       #   不能靠关宏来回退到 BakaSU 原生实现。
       # 详见 docs/haotian-hyperos4-susfs-notes.md。
 
-      - name: 让 selinux_hide 真正查 BakaSU 备份策略
+      - name: 让 selinux_hide 只伪造 selinuxfs 探测结果
         if: inputs.enable_susfs
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
-          set -euo pipefail
-          # Duck Detector 实测：selinux_hide 显示 enabled/running，但对应用完全空转。
-          #   uid 10464 写 u:r:ksu:s0 到 /sys/fs/selinux/context -> 成功（本应 EINVAL）
-          #   untrusted_app -> ksu_file / lsposed_file:file read -> Allowed
+          set -eo pipefail
+          # Duck Detector 在 r5 实测：selinux_hide 显示 enabled，但应用 uid 写
+          # u:r:ksu:s0 / lsposed_file 到 /sys/fs/selinux/context 全部 rc=0（本应 EINVAL）。
           #
-          # 根因：SUSFS 的 susfs_security_context_to_sid_core /
-          #   susfs_security_compute_av_user 取的是 rcu_dereference(selinux_state.policy)，
-          #   即施加过 KSU 规则的「脏」策略，而不是原厂备份，所以查出来当然 allowed。
-          #   门控本身没问题（handle_sel_write_context/access 已判 uid>=10000 && running）。
+          # 第一版修复把 susfs_security_context_to_sid_core 与
+          # susfs_security_compute_av_user 的策略取值整体换成 backup_sepolicy，
+          # 结果 zygote 给应用设上下文时拿"只有 initial SID"的备份策略查不到应用类型，
+          # selinux_android_setcontext 全部 -EINVAL，zygote 逐个 SIGABRT，
+          # system_server 被判死反复重启，系统卡在开机动画（实测 58 次失败、10 个包）。
           #
-          # 修法：保持 KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE 定义（关它会链接失败，
-          #   见上方注释），只把这两处的策略取值换成 BakaSU 的 backup_sepolicy。
-          #   backup_sepolicy 在 6.6（>=5.10）分支是全局非 static，且宏定义时
-          #   ksu_selinux_hide_running 也是全局，链接期没有问题。
-          #   它只在 !ksu_selinux_hide_running 时被 drop_backup_if_unused 释放并置 NULL，
-          #   与这里先判 running 的顺序一致（与 BakaSU 原生实现的用法相同）。
-          # 兜底：任一前提不满足就整步跳过，退回当前行为，不影响开机。
+          # 原因：那两个函数是共用的——hooks.c 的 setxattr/setprocattr 也走它们，
+          # 而 setprocattr 正是应用启动的关键路径。所以不能全局改策略。
+          #
+          # 本版改为按调用方分流：
+          #   * core 增加 hide 参数；三个内部包装（_default/_force/原函数）一律 hide=0，
+          #     保持实时策略，应用启动路径完全不受影响；
+          #   * 新增 susfs_security_context_to_sid_hide，hide=1 才查 backup_sepolicy；
+          #   * selinuxfs.c 的探测入口（handle_sel_write_context）改调该变体。
+          # compute_av_user 只被 selinuxfs 的 access 入口使用，按 uid>=10000 门控即可。
           SVC="$PWD/common/security/selinux/ss/services.c"
-          if [ ! -f "$SVC" ]; then
-            echo "未找到 ss/services.c，跳过"
+          SFS="$PWD/common/security/selinux/selinuxfs.c"
+          if [ ! -f "$SVC" ] || [ ! -f "$SFS" ]; then
+            echo "未找到 selinux 源文件，跳过"
             exit 0
           fi
           if ! grep -q 'susfs_security_compute_av_user' "$SVC"; then
             echo "SUSFS 未补丁 services.c，跳过"
             exit 0
           fi
-          if ! grep -rq 'struct selinux_policy \*backup_sepolicy;' "$PWD/KernelSU/kernel"; then
+          if ! grep -rqF 'struct selinux_policy *backup_sepolicy;' "$PWD/KernelSU/kernel"; then
             echo "KernelSU 未提供 backup_sepolicy（非 >=5.10 分支？），跳过"
             exit 0
           fi
-          python3 - "$SVC" <<'PY'
+          python3 - "$SVC" "$SFS" <<'PY'
           import sys
 
-          path = sys.argv[1]
-          src = open(path, encoding="utf-8").read()
+          svc, sfs = sys.argv[1], sys.argv[2]
+          src = open(svc, encoding="utf-8").read()
 
-          if "susfs_hide_policy" in src:
-              print("已处理过，跳过")
+          # 幂等标记用新符号，避免和上一版（全局替换策略取值）混淆
+          if "susfs_security_context_to_sid_hide" in src:
+              print("已打过本补丁，跳过")
               sys.exit(0)
 
-          helper = (
-              "/* added by build.yml: query BakaSU pre-KSU backup policy when hiding */\n"
-              "extern bool ksu_selinux_hide_running;\n"
-              "extern struct selinux_policy *backup_sepolicy;\n"
-              "\n"
-              "static inline struct selinux_policy *susfs_hide_policy(void)\n"
-              "{\n"
-              "\tstruct selinux_policy *live = rcu_dereference(selinux_state.policy);\n"
-              "\n"
-              "\tif (current_uid().val >= 10000 && ksu_selinux_hide_running &&\n"
-              "\t    backup_sepolicy)\n"
-              "\t\treturn backup_sepolicy;\n"
-              "\treturn live;\n"
-              "}\n"
-              "\n"
-          )
+          CORE = "static int susfs_security_context_to_sid_core("
+          POL = "policy = rcu_dereference(selinux_state.policy);"
+          KEEP = src.count(CORE)
 
-          anchor = "static int susfs_security_context_to_sid_core("
-          i = src.find(anchor)
+          p = src.find(CORE)
+          if p < 0:
+              print("未找到 susfs core（SUSFS 补丁未应用？），跳过")
+              sys.exit(0)
+          pend = src.find("{", p)
+          sig = src[p:pend]
+          if "int force)" not in sig:
+              print("core 签名不符合预期，跳过")
+              sys.exit(0)
+          src = src[:p] + sig.replace("int force)", "int force, int hide)") + src[pend:]
+
+          # 只改 SUSFS core 内的策略取值；原生 security_context_to_sid_core 在 p 之前，不会被碰到
+          ps = src.find(POL, p)
+          if ps < 0:
+              print("core 内未找到策略取值行，跳过")
+              sys.exit(0)
+          src = src[:ps] + (
+              "policy = (hide && backup_sepolicy) ?\n"
+              "\t\tbackup_sepolicy : rcu_dereference(selinux_state.policy);"
+          ) + src[ps + len(POL):]
+
+          # 三个 SUSFS 包装函数的调用尾：必须从 core 之后找，
+          # 否则会命中原生 security_context_to_sid_default/force（签名只有 6 个参数）
+          repls = [("sid, SECSID_NULL, gfp, 0);", "sid, SECSID_NULL, gfp, 0, 0);"),
+                   ("sid, def_sid, gfp_flags, 1);", "sid, def_sid, gfp_flags, 1, 0);"),
+                   ("sid, SECSID_NULL, GFP_KERNEL, 1);", "sid, SECSID_NULL, GFP_KERNEL, 1, 0);")]
+          for old, new in repls:
+              at = src.find(old, p)
+              if at < 0:
+                  print("core 之后未找到调用尾 " + old + "，跳过")
+                  sys.exit(0)
+              src = src[:at] + new + src[at + len(old):]
+
+          anchor = "int susfs_security_context_str_to_sid("
+          i = src.find(anchor, p)
           if i < 0:
-              raise SystemExit("找不到 susfs_security_context_to_sid_core，放弃")
-          src = src[:i] + helper + src[i:]
+              print("未找到插入锚点，跳过")
+              sys.exit(0)
+          hidefn = (
+              "/* added by build.yml: 仅供 selinuxfs 探测入口使用，走备份策略以隐藏 KSU 类型。\n"
+              " * 内部 setprocattr/setxattr 绝不能走这里：zygote 给应用设上下文时若查\n"
+              " * 只有 initial SID 的备份策略，会 -EINVAL 导致应用起不来、系统无法开机。*/\n"
+              "int susfs_security_context_to_sid_hide(const char *scontext, u32 scontext_len,\n"
+              "\t\t\t\tu32 *sid, gfp_t gfp)\n"
+              "{\n"
+              "\treturn susfs_security_context_to_sid_core(scontext, scontext_len,\n"
+              "\t\t\t\t\t\tsid, SECSID_NULL, gfp, 0, 1);\n"
+              "}\n\n")
+          src = src[:i] + hidefn + src[i:]
 
-          old = "policy = rcu_dereference(selinux_state.policy);"
-          new = "policy = susfs_hide_policy();"
-          patched = 0
-          for fn in (anchor, "void susfs_security_compute_av_user("):
-              j = src.find(fn)
-              if j < 0:
-                  raise SystemExit("找不到 " + fn)
-              k = src.find(old, j)
-              if k < 0:
-                  raise SystemExit(fn + " 内未找到策略取值行")
-              src = src[:k] + new + src[k + len(old):]
-              patched += 1
+          j = src.find("void susfs_security_compute_av_user(", p)
+          k = src.find(POL, j) if j > 0 else -1
+          if k < 0:
+              print("compute_av_user 内未找到策略取值行，跳过")
+              sys.exit(0)
+          src = src[:k] + (
+              "policy = (current_uid().val >= 10000 && ksu_selinux_hide_running &&\n"
+              "\t\t   backup_sepolicy) ? backup_sepolicy :\n"
+              "\t\t  rcu_dereference(selinux_state.policy);"
+          ) + src[k + len(POL):]
 
-          if patched != 2:
-              raise SystemExit("策略取值替换数不为 2，放弃")
-
+          # extern 插在 core 定义之前；此时必须按当前文本重新定位，不能复用旧的 p
+          pp = src.find(CORE)
+          if pp < 0:
+              print("重定位 core 失败，跳过")
+              sys.exit(0)
+          if "extern struct selinux_policy *backup_sepolicy;" not in src:
+              src = src[:pp] + ("extern bool ksu_selinux_hide_running;\n"
+                                "extern struct selinux_policy *backup_sepolicy;\n\n") + src[pp:]
           if "#include <linux/cred.h>" not in src:
               lines = src.split("\n")
               for n, line in enumerate(lines):
@@ -1799,11 +1837,43 @@ jobs:
                       break
               src = "\n".join(lines)
 
-          open(path, "w", encoding="utf-8").write(src)
-          print("已替换策略取值处数:", patched)
+          # 写回前自检：任何一项不成立都说明打歪了，宁可失败也不落盘
+          head = src[:pp]
+          bad = []
+          if ("sid, SECSID_NULL, gfp, 0, 0);" in head
+                  or "sid, def_sid, gfp_flags, 1, 0);" in head
+                  or "sid, SECSID_NULL, GFP_KERNEL, 1, 0);" in head):
+              bad.append("原生 security_context_to_sid_core 调用被改")
+          if "returextern" in src or "extern bool ksu_selinux_hide_running;\n" not in src:
+              bad.append("extern 插入位置错误")
+          if src.count(CORE) != KEEP:
+              bad.append("core 出现次数变化 %d->%d" % (KEEP, src.count(CORE)))
+          if src.count(", 0, 1);") != 1:
+              bad.append("hide 变体数量异常")
+          if "current_uid().val >= 10000" not in src:
+              bad.append("compute_av 门控缺失")
+          if bad:
+              print("自检失败，不写回: " + "；".join(bad))
+              sys.exit(1)
+          open(svc, "w", encoding="utf-8").write(src)
+
+          fsrc = open(sfs, encoding="utf-8").read()
+          old_ext = ("extern int susfs_security_context_to_sid(const char *scontext, "
+                     "u32 scontext_len, u32 *sid, gfp_t gfp);")
+          if old_ext in fsrc:
+              fsrc = fsrc.replace(old_ext,
+                                  "extern int susfs_security_context_to_sid_hide(const char *scontext, "
+                                  "u32 scontext_len, u32 *sid, gfp_t gfp);", 1)
+          call_old = "susfs_security_context_to_sid(buf, size, &sid, GFP_KERNEL)"
+          if call_old in fsrc:
+              fsrc = fsrc.replace(call_old, "susfs_security_context_to_sid_hide(buf, size, &sid, GFP_KERNEL)", 1)
+          if "_hide(buf" not in fsrc or "_hide(const char" not in fsrc:
+              print("selinuxfs.c 探测入口未改到，跳过")
+              sys.exit(0)
+          open(sfs, "w", encoding="utf-8").write(fsrc)
+
+          print("OK: core 增加 hide 参数；新增 _hide 变体；selinuxfs 探测改走备份策略；其余路径保持实时策略")
           PY
-          echo "===== 校验 ====="
-          grep -n 'susfs_hide_policy' "$SVC"
 
       - name: 修复 KSU 侧 SUSFS 声明与未使用告警
         if: inputs.enable_susfs
@@ -2015,7 +2085,17 @@ jobs:
               else
                 # 提取 gki_defconfig 修改到 fragment，避免 bazel trim 检查失败
                 FRAG="common/arch/arm64/configs/ksu.fragment"
-                diff "$DEFCONFIG.orig" "$DEFCONFIG" | grep '^>' | sed 's/^> //; s/^[[:space:]]*//' > "$FRAG" || true
+                diff "$DEFCONFIG.orig" "$DEFCONFIG" | grep '^>' | sed 's/^> //; s/^[[:space:]]*//' > "$FRAG.tmp" || true
+                # 重试时 defconfig 已被上一次还原成 .orig，diff 必然为空；
+                # 此时必须沿用上一次生成的 fragment，否则 KSU/SUSFS/NTSYNC 配置全丢
+                if [ -s "$FRAG.tmp" ]; then
+                  mv "$FRAG.tmp" "$FRAG"
+                elif [ -s "$FRAG" ]; then
+                  echo "沿用上一次生成的 fragment（重试场景：defconfig 已还原）"
+                else
+                  echo "::warning::fragment 为空且无历史内容，本次构建将缺少 KSU/SUSFS/NTSYNC 配置"
+                fi
+                rm -f "$FRAG.tmp"
                 cp "$DEFCONFIG.orig" "$DEFCONFIG"
                 echo "=== KSU Fragment 内容 ==="
                 cat "$FRAG"
